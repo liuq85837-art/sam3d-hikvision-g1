@@ -1,0 +1,47 @@
+# Local environments and dependency caches
+/.venv/
+/venv/
+/env/
+/wheels/
+node_modules/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Generated data, source recordings and delivery archives
+/delivery/
+/outputs/
+/input_audit/
+/logs/
+/validation/
+/retarget/qa_synthetic/
+*.avi
+*.mp4
+*.mov
+*.svo
+*.svo2
+*.zip
+*.tar
+*.zst
+
+# Model checkpoints are distributed separately
+*.ckpt
+*.pth
+*.pt
+
+# Generated manual with embedded recording frames, and QA screenshots
+/docs/SAM3D_零基础完整说明书.html
+/docs/manual_assets/manual_*.png
+
+# Original upstream backup files; annotation patches are tracked instead
+/source_annotation_backups/**/*.py
+
+# Local settings and temporary files
+.env
+.env.*
+!.env.example
+*.tmp
+*.partial*
+.DS_Store
+Thumbs.db

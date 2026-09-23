@@ -1,0 +1,21 @@
+{
+  "source": "C:\\YXW\\视觉\\hik_g1\\docs\\SAM3D_零基础完整说明书.md",
+  "chapters": 22,
+  "markdown_characters": 36823,
+  "local_and_anchor_links_checked": 37,
+  "python_blocks_compiled": 5,
+  "read_only_examples_executed": [
+    {
+      "passed": true,
+      "output": "字段： ['joints_camera', 'keypoints_2d', 'keypoints_2d_calibrated', 'joint_names', 'valid', 'K', 'timestamps_s', 'frame_indices', 'metric_scale_status', 'joints_world', 'world_joints', 'joints_world_raw', 'pelvis_world', 'source_person_valid', 'timestamps_ns', 'timestamp_ns', 'T_world_from_camera', 'constant_body_scale', 'world_frame_id', 'metadata', 'source_metadata']\n形状： (461, 70, 3)\n有效样本： 461 / 461\n第一个有效时间： 0.0 秒\n对应源帧： 0\n骨盆xyz： [0.00310655 0.07309715 0.81334877]\n尺度状态： model_prior_only\n"
+    },
+    {
+      "passed": true,
+      "output": "qpos / qvel： (461, 36) (461, 35)\n根位置xyz： [0.00310669 0.07309796 0.78630743]\n根四元数wxyz： [0.28530425 0.         0.         0.958437  ]\nleft_hip_pitch_joint: -0.1205 rad = -6.91 deg\nleft_hip_roll_joint: -0.1887 rad = -10.81 deg\nleft_hip_yaw_joint: 0.0265 rad = 1.52 deg\nleft_knee_joint: 0.1172 rad = 6.71 deg\nleft_ankle_pitch_joint: -0.0018 rad = -0.10 deg\nleft_ankle_roll_joint: 0.1824 rad = 10.45 deg\nright_hip_pitch_joint: -0.1083 rad = -6.20 deg\nright_hip_roll_joint: -0.0012 rad = -0.07 deg\nright_hip_yaw_joint: 0.0702 rad = 4.02 deg\nright_knee_joint: 0.1967 rad = 11.27 deg\nright_ankle_pitch_joint: -0.0982 rad = -5.62 deg\nright_ankle_roll_joint: 0.0206 rad = 1.18 deg\nwaist_yaw_joint: -0.0620 rad = -3.55 deg\nwaist_roll_joint: 0.0035 rad = 0.20 deg\nwaist_pitch_joint: -0.0357 rad = -2.04 deg\nleft_shoulder_pitch_joint: 0.0919 rad = 5.27 deg\nleft_shoulder_roll_joint: -0.0278 rad = -1.59 deg\nleft_shoulder_yaw_joint: 0.0457 rad = 2.62 deg\nleft_elbow_joint: 1.0043 rad = 57.54 deg\nleft_wrist_roll_joint: 0.0039 rad = 0.22 deg\nleft_wrist_pitch_joint: 0.1480 rad = 8.48 deg\nleft_wrist_yaw_joint: 0.0000 rad = 0.00 deg\nright_shoulder_pitch_joint: 0.0349 rad = 2.00 deg\nright_shoulder_roll_joint: -0.0301 rad = -1.73 deg\nright_shoulder_yaw_joint: -0.0886 rad = -5.08 deg\nright_elbow_joint: 0.9080 rad = 52.02 deg\nright_wrist_roll_joint: -0.0060 rad = -0.35 deg\nright_wrist_pitch_joint: 0.1428 rad = 8.18 deg\nright_wrist_yaw_joint: 0.0000 rad = 0.00 deg\n"
+    }
+  ],
+  "powershell_blocks_for_syntax_check": 20,
+  "no_inference_or_retargeting_performed": true,
+  "passed": true,
+  "powershell_syntax_passed": true
+}

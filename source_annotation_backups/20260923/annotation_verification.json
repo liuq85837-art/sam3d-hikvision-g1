@@ -1,0 +1,34 @@
+{
+  "change": "Chinese comments only; original source lines preserved",
+  "files": [
+    {
+      "source": "C:\\YXW\\视觉\\pose_world_sam3d_repro_20260918\\pose_project\\sam3d\\repo\\sam_3d_body\\models\\meta_arch\\sam3d_body.py",
+      "backup": "C:\\YXW\\视觉\\hik_g1\\source_annotation_backups\\20260923\\sam3d_body.py",
+      "original_sha256": "851b7475f18b56891aa02606e7c0ee9e03120fa208cc85df5127b792e1abfeee",
+      "annotated_sha256": "ed8b9c5ec146fff252c903acb10384fa8b2b2de517a21cc2758cd6809fe84740",
+      "original_lines": 2025,
+      "annotated_lines": 2232,
+      "added_comment_lines": 206,
+      "all_original_lines_byte_identical_and_order_preserved": true,
+      "ast_identical_ignoring_locations": true,
+      "code_tokens_identical": true,
+      "syntax_compile": "passed"
+    },
+    {
+      "source": "C:\\YXW\\视觉\\pose_world_sam3d_repro_20260918\\pose_project\\sam3d\\repo\\sam_3d_body\\sam_3d_body_estimator.py",
+      "backup": "C:\\YXW\\视觉\\hik_g1\\source_annotation_backups\\20260923\\sam_3d_body_estimator.py",
+      "original_sha256": "8bfa34316d82eabbe185c1cd64a77c47670785cdb0fa489b1481fb468266a145",
+      "annotated_sha256": "cac598294307260ef97b3e891978da542fb467008f590ee11a4c2bb7997fe5ac",
+      "original_lines": 260,
+      "annotated_lines": 340,
+      "added_comment_lines": 80,
+      "all_original_lines_byte_identical_and_order_preserved": true,
+      "ast_identical_ignoring_locations": true,
+      "code_tokens_identical": true,
+      "syntax_compile": "passed"
+    }
+  ],
+  "total_added_comment_lines": 286,
+  "all_checks_passed": true,
+  "comment_semantic_review": "completed; body/hand coordinate conventions and output descriptions checked against callees"
+}

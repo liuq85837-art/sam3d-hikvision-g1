@@ -1,0 +1,11 @@
+{
+  "torch": "2.8.0+cu128",
+  "torchvision": "0.23.0+cu128",
+  "numpy": "2.4.6",
+  "scipy": "1.17.1",
+  "mujoco": "3.3.7",
+  "opencv-python": "5.0.0.93",
+  "pytorch-lightning": "2.6.6",
+  "ultralytics": "8.4.158",
+  "timm": "1.0.29"
+}

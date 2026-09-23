@@ -1,0 +1,38 @@
+{
+  "passed": true,
+  "validated_at": "2026-09-23T14:18:33+08:00",
+  "git_version": "git version 2.55.0.windows.5",
+  "temporary_original_copies_used": true,
+  "temporary_directory_removed": true,
+  "git_repository_created": false,
+  "forward_apply_matches_annotated_bytes": true,
+  "reverse_apply_matches_original_bytes": true,
+  "sibling_source_unchanged": true,
+  "all_original_lines_byte_identical_and_order_preserved": true,
+  "tokens_and_ast_equal": true,
+  "syntax_compile_without_imports": "passed",
+  "sam_license_byte_identical": true,
+  "line_endings": "Per-command core.autocrlf=false and core.eol=lf; no global Git configuration changed.",
+  "commands": [
+    {
+      "command": "git -c core.autocrlf=false -c core.eol=lf apply --check",
+      "returncode": 0,
+      "stderr": ""
+    },
+    {
+      "command": "git -c core.autocrlf=false -c core.eol=lf apply ",
+      "returncode": 0,
+      "stderr": ""
+    },
+    {
+      "command": "git -c core.autocrlf=false -c core.eol=lf apply --reverse --check",
+      "returncode": 0,
+      "stderr": ""
+    },
+    {
+      "command": "git -c core.autocrlf=false -c core.eol=lf apply --reverse",
+      "returncode": 0,
+      "stderr": ""
+    }
+  ]
+}

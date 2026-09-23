@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "asset": "yolo11n.pt",
+  "purpose": "Person bounding boxes only; SAM 3D Body reconstructs human 3D pose.",
+  "default_relative_path": "assets/yolo11n.pt",
+  "bytes": 5613764,
+  "sha256": "0ebbc80d4a7680d14987a577cd21342b65ecfd94632bd9a8da63ae6417644ee1",
+  "repository_url": "https://github.com/ultralytics/assets",
+  "release_url": "https://github.com/ultralytics/assets/releases/tag/v8.3.0",
+  "download_url": "https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n.pt",
+  "url_provenance": "Official release recorded in README_CN.md; download URL follows that release asset path.",
+  "verification": {
+    "local_sha256_recomputed": true,
+    "matches_existing_inference_detector_sha256": true,
+    "remote_redownload_performed": false
+  },
+  "weights_copied_or_included_by_this_manifest": false,
+  "license_note": "Upstream asset remains subject to its applicable upstream license; this provenance file grants no additional rights."
+}

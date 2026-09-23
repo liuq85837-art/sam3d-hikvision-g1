@@ -1,0 +1,22 @@
+[
+  "Set-Location -LiteralPath 'C:\\YXW\\视觉\\hik_g1'\nGet-Location\n",
+  "& 'C:\\YXW\\视觉\\hik_g1\\.venv\\Scripts\\python.exe' --version\n",
+  "Start-Process -FilePath 'C:\\YXW\\视觉\\hik_g1\\outputs\\Video_20260922162126269\\comparison.mp4'\n",
+  "Set-Location -LiteralPath 'C:\\YXW\\视觉\\hik_g1'\n",
+  ".\\.venv\\Scripts\\python.exe --version\n.\\.venv\\Scripts\\python.exe -c \"import torch; print('PyTorch:', torch.__version__); print('CUDA available:', torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'No CUDA GPU')\"\n",
+  "Test-Path -LiteralPath 'C:\\Users\\liuq8\\MVS\\Data\\MV-CS020-10GC(DB2677346)\\Video_20260922162126269.avi'\nTest-Path -LiteralPath 'C:\\YXW\\视觉\\pose_world_sam3d_repro_20260918\\pose_project\\sam3d\\checkpoints\\user_dinov3_20260917\\model.ckpt'\nTest-Path -LiteralPath 'C:\\YXW\\视觉\\pose_world_sam3d_repro_20260918\\pose_project\\sam3d\\checkpoints\\user_dinov3_20260917\\assets\\mhr_model.pt'\nTest-Path -LiteralPath 'C:\\YXW\\视觉\\hik_g1\\assets\\unitree_g1\\scene.xml'\n",
+  "Get-Command ffmpeg, ffprobe\n",
+  "$env:Path = 'C:\\YXW\\视觉\\tools\\ffmpeg\\ffmpeg-9.0.2-essentials_build\\bin;' + $env:Path\n",
+  ".\\.venv\\Scripts\\python.exe run_pipeline.py --help\n.\\.venv\\Scripts\\python.exe infer_hik.py --help\n",
+  "Set-Location -LiteralPath 'C:\\YXW\\视觉\\hik_g1'\n$taskVideo = 'C:\\Users\\liuq8\\MVS\\Data\\MV-CS020-10GC(DB2677346)\\Video_20260922162126269.avi'\n$taskOutput = Join-Path (Get-Location) ('outputs\\tutorial_' + (Get-Date -Format 'yyyyMMdd_HHmmss'))\n.\\.venv\\Scripts\\python.exe run_pipeline.py --video $taskVideo --output $taskOutput --stride 4 --max-frames 120\nWrite-Output $taskOutput\n",
+  "Start-Process -FilePath (Join-Path $taskOutput 'comparison.mp4')\n",
+  "Set-Location -LiteralPath 'C:\\YXW\\视觉\\hik_g1'\n$taskVideo = 'C:\\Users\\liuq8\\MVS\\Data\\MV-CS020-10GC(DB2677346)\\Video_20260922162126269.avi'\n$taskOutput = Join-Path (Get-Location) ('outputs\\full_' + (Get-Date -Format 'yyyyMMdd_HHmmss'))\n.\\.venv\\Scripts\\python.exe run_pipeline.py --video $taskVideo --output $taskOutput --stride 4\n",
+  ".\\.venv\\Scripts\\python.exe run_pipeline.py --video $taskVideo --output $taskOutput --skip-prepare\n",
+  "Set-Location -LiteralPath 'C:\\YXW\\视觉\\hik_g1'\n.\\.venv\\Scripts\\python.exe read_human_example.py\n",
+  "Set-Location -LiteralPath 'C:\\YXW\\视觉\\hik_g1'\n.\\.venv\\Scripts\\python.exe read_g1_example.py\n",
+  "Set-Location -LiteralPath 'C:\\YXW\\视觉\\hik_g1'\n$taskClip = 'outputs\\Video_20260922162126269'\n$taskVideo = 'C:\\Users\\liuq8\\MVS\\Data\\MV-CS020-10GC(DB2677346)\\Video_20260922162126269.avi'\n$taskPreview = 'outputs\\manual_preview_' + (Get-Date -Format 'yyyyMMdd_HHmmss') + '.mp4'\n.\\.venv\\Scripts\\python.exe visualization\\render_comparison.py `\n  --human \"$taskClip\\world_temporal\\world_joints.npz\" `\n  --robot \"$taskClip\\g1_motion_temporal.npz\" `\n  --model assets\\unitree_g1\\scene.xml `\n  --source-video $taskVideo `\n  --match-source-camera `\n  --quality-label 'ROOT-SMOOTHED / MODEL-SCALE / UNCALIBRATED' `\n  --pose-label 'source 2D / raw SAM 3D projection' `\n  --title 'My first SAM 3D and G1 preview' `\n  --start-s 0 --duration-s 5 --fps 30 `\n  --output $taskPreview\n",
+  "Set-Location -LiteralPath 'C:\\YXW\\视觉\\hik_g1'\n$taskRobot = 'outputs\\g1_ik_trial_' + (Get-Date -Format 'yyyyMMdd_HHmmss') + '.npz'\n.\\.venv\\Scripts\\python.exe retarget\\world_to_g1.py outputs\\Video_20260922162126269\\world\\world_joints.npz $taskRobot --iterations 25\n",
+  "Set-Location -LiteralPath 'C:\\YXW\\视觉\\hik_g1'\n$taskSource = 'outputs\\Video_20260922162126269\\camera\\camera_sequence.npz'\n$taskOutput = Join-Path (Get-Location) ('outputs\\downstream_' + (Get-Date -Format 'yyyyMMdd_HHmmss'))\nNew-Item -ItemType Directory -Path (Join-Path $taskOutput 'camera') | Out-Null\nCopy-Item -LiteralPath $taskSource -Destination (Join-Path $taskOutput 'camera\\camera_sequence.npz')\n.\\.venv\\Scripts\\python.exe run_pipeline.py --video 'C:\\Users\\liuq8\\MVS\\Data\\MV-CS020-10GC(DB2677346)\\Video_20260922162126269.avi' --output $taskOutput --skip-prepare --skip-infer\n",
+  "Set-Location -LiteralPath 'C:\\YXW\\视觉\\hik_g1'\n.\\.venv\\Scripts\\python.exe -m py_compile infer_hik.py run_pipeline.py\n",
+  "Set-Location -LiteralPath 'C:\\YXW\\视觉\\hik_g1'\n.\\.venv\\Scripts\\python.exe run_pipeline.py --video 'C:\\你的数据\\去畸变视频.avi' --output 'outputs\\calibrated_trial' --intrinsics 'C:\\你的标定\\intrinsics.json' --world-calibration 'C:\\你的标定\\world.json'\n"
+]

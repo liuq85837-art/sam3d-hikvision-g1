@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "description": "Chinese reading comments and non-semantic spacing; no inference logic changes.",
+  "upstream": {
+    "sam3d": {
+      "repository": "https://github.com/facebookresearch/sam-3d-body",
+      "commit": "b5c765a0d89d789985e186d396315e7590887b94",
+      "commit_evidence": "Original reproduction package pose_project/sam3d/README_CN.md; byte hashes below remain authoritative for patch applicability."
+    },
+    "dinov3": {
+      "repository": "https://github.com/facebookresearch/dinov3",
+      "commit": "6876159a11b4df116f30f667f8c9888617df0751",
+      "commit_evidence": "Original reproduction package dinov3_official/SOURCE_PROVENANCE.json",
+      "modified_by_these_patches": false
+    }
+  },
+  "sam_license": {
+    "file": "LICENSE.sam3d",
+    "upstream_path": "LICENSE",
+    "sha256": "b3a5a0e2d973ab80e6610ccf1cffc40756050d0ace3cd4fec879b3ec290b2e9b",
+    "copied_byte_for_byte": true
+  },
+  "files": [
+    {
+      "target_path": "sam_3d_body/sam_3d_body_estimator.py",
+      "patch": "sam_3d_body_estimator.patch",
+      "patch_sha256": "3bedb8e97e77b7c347ddf6f360fc2cbe22251b5e63ac52e781edef48959e4d25",
+      "original_sha256": "8bfa34316d82eabbe185c1cd64a77c47670785cdb0fa489b1481fb468266a145",
+      "annotated_sha256": "cac598294307260ef97b3e891978da542fb467008f590ee11a4c2bb7997fe5ac",
+      "original_bytes": 10121,
+      "annotated_bytes": 19821,
+      "original_lines": 260,
+      "annotated_lines": 340,
+      "added_comment_lines": 80,
+      "added_blank_lines": 0,
+      "backup_relative_to_project": "source_annotation_backups/20260923/sam_3d_body_estimator.py",
+      "tokens_equal_ignoring_COMMENT_NL": true,
+      "ast_equal_ignoring_locations": true,
+      "syntax_compile_without_imports": "passed",
+      "original_lines_byte_identical_and_order_preserved": true
+    },
+    {
+      "target_path": "sam_3d_body/models/meta_arch/sam3d_body.py",
+      "patch": "sam3d_body.patch",
+      "patch_sha256": "057c042b2c87a8954bbf05a1e88e122cbe8802e872e793170c05d7f033c11b91",
+      "original_sha256": "851b7475f18b56891aa02606e7c0ee9e03120fa208cc85df5127b792e1abfeee",
+      "annotated_sha256": "ed8b9c5ec146fff252c903acb10384fa8b2b2de517a21cc2758cd6809fe84740",
+      "original_bytes": 80820,
+      "annotated_bytes": 101183,
+      "original_lines": 2025,
+      "annotated_lines": 2232,
+      "added_comment_lines": 206,
+      "added_blank_lines": 1,
+      "backup_relative_to_project": "source_annotation_backups/20260923/sam3d_body.py",
+      "tokens_equal_ignoring_COMMENT_NL": true,
+      "ast_equal_ignoring_locations": true,
+      "syntax_compile_without_imports": "passed",
+      "original_lines_byte_identical_and_order_preserved": true
+    }
+  ],
+  "weights_included": false
+}

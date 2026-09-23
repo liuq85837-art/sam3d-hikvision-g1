@@ -1,0 +1,934 @@
+diff --git a/sam_3d_body/models/meta_arch/sam3d_body.py b/sam_3d_body/models/meta_arch/sam3d_body.py
+--- a/sam_3d_body/models/meta_arch/sam3d_body.py
++++ b/sam_3d_body/models/meta_arch/sam3d_body.py
+@@ -1,5 +1,25 @@
+ # Copyright (c) Meta Platforms, Inc. and affiliates.
+ 
++# 中文阅读导航：本文件实现 SAM 3D Body 的网络组装与单图前向推理。
++# 外部入口：SAM3DBodyEstimator.process_one_image -> run_inference。
++# 主调用链：run_inference -> forward_step -> forward_pose_branch
++#          -> backbone -> forward_decoder / forward_decoder_hand -> MHR 与相机头。
++# full 模式还会裁剪双手、细化手部，再把可信的手部结果融合回身体。
++#
++# 张量约定：B 是图像数，N 是每图人数，P=B*N 是展开后的裁剪样本数；
++# C 是特征通道，D 是解码器维度，J 通常为 70 个输出关键点。
++# batch['img'] 为 [B,N,3,H,W]，进入主干后为 [P,3,H,W]。
++# 原代码局部注释中的 B 往往指展开后的 P；具体维度以配置和张量为准。
++#
++# 坐标约定：原图 2D 点用像素；裁剪点用 [-0.5,0.5]，提示点用 [0,1]；
++# grid_sample 的采样点用 [-1,1]，这三种归一化坐标不要混用。
++# pred_keypoints_3d / pred_vertices 尚未加相机平移；加 pred_cam_t 后才是
++# 相机坐标中的位置。这里没有估计相机的世界外参，也没有处理视频时序或回环。
++# 全局旋转 global_rot 指人体模型的整体朝向，不等于已经标定的世界朝向。
++# 固定世界坐标重建、时间平滑和 G1 重定向由 hik_g1 的后续流程负责。
++
++# 类型注解用于说明接口；numpy 主要处理边界框，torch 负责网络与张量运算，
++# roma 用于欧拉角、旋转矩阵等旋转表示之间的转换。
+ from typing import Any, Dict, Optional, Tuple
+ 
+ import numpy as np
+@@ -29,6 +49,8 @@
+ logger = get_pylogger(__name__)
+ 
+ 
++# 提示标签采用 MHR70 关键点编号；不要与 MHR 内部骨骼索引、姿态参数索引混淆。
++# 三种编号会在后面的手腕融合中同时出现，例如关键点 41 与骨骼 41 含义不同。
+ # fmt: off
+ PROMPT_KEYPOINTS = {  # keypoint_idx: prompt_idx
+     "mhr70": {
+@@ -40,10 +62,16 @@
+ # fmt: on
+ 
+ 
++# BaseModel 负责公共预处理、人数维展开和设备/精度等基础设施。
++# 本类通过读取 self.cfg 构建网络，实际权重由模型加载入口从 checkpoint 恢复。
+ class SAM3DBody(BaseModel):
++    # 输出关键点中左右髋的中点用于构造骨盆相对特征，不会在此锁定世界根位置。
+     pelvis_idx = [9, 10]  # left_hip, right_hip
+ 
++    # 网络初始化：由 BaseModel.__init__ 调用；方法名沿用上游的 _initialze 拼写。
++    # 这里只创建模块和初始化参数，不读取图片，也不执行整段视频推理。
+     def _initialze_model(self):
++        # 均值/标准差作为非持久 buffer 随模型移动设备，不参加梯度优化。
+         self.register_buffer(
+             "image_mean", torch.tensor(self.cfg.MODEL.IMAGE_MEAN).view(-1, 1, 1), False
+         )
+@@ -52,9 +80,12 @@
+         )
+ 
+         # Create backbone feature extractor for human crops
++        # 主干类型由配置选择；当前项目使用的 DINOv3 也是从此工厂创建。
+         self.backbone = create_backbone(self.cfg.MODEL.BACKBONE.TYPE, self.cfg)
+ 
+         # Create header for pose estimation output
++        # MHR 头把姿态 token 转成身体/手部/形状/尺度参数，并生成网格与关节点。
++        # 保存原手部基，再换为 54 维单位基；这是模型既有参数约定。
+         self.head_pose = build_head(self.cfg, self.cfg.MODEL.PERSON_HEAD.POSE_TYPE)
+         self.head_pose.hand_pose_comps_ori = nn.Parameter(
+             self.head_pose.hand_pose_comps.clone(), requires_grad=False
+@@ -65,9 +96,11 @@
+ 
+         # Initialize pose token with learnable params
+         # Note: bias/initial value should be zero-pose in cont, not all-zeros
++        # 可学习的初始姿态用于残差预测；它不是上一帧的姿态。
+         self.init_pose = nn.Embedding(1, self.head_pose.npose)
+ 
+         # Define header for hand pose estimation
++        # 手部裁剪使用独立预测头及初始姿态；身体头与手部头不共享这一组权重。
+         self.head_pose_hand = build_head(
+             self.cfg, self.cfg.MODEL.PERSON_HEAD.POSE_TYPE, enable_hand_model=True
+         )
+@@ -79,6 +112,8 @@
+         )
+         self.init_pose_hand = nn.Embedding(1, self.head_pose_hand.npose)
+ 
++        # 相机头先预测 (s, tx, ty)，再结合框大小和内参换算完整相机平移。
++        # 这些参数描述人与相机的关系，不是相机在世界中的运动轨迹。
+         self.head_camera = build_head(self.cfg, self.cfg.MODEL.PERSON_HEAD.CAMERA_TYPE)
+         self.init_camera = nn.Embedding(1, self.head_camera.ncam)
+         nn.init.zeros_(self.init_camera.weight)
+@@ -96,6 +131,8 @@
+         self.camera_type = "perspective"
+ 
+         # Support conditioned information for decoder
++        # 3 维条件是 CLIFF 的框中心偏移与框尺度；与姿态/相机参数一起编码成 token。
++        # prev_to_token 不拼接这 3 维条件，用来表示同一图片上一轮提示的预测。
+         cond_dim = 3
+         init_dim = self.head_pose.npose + self.head_camera.ncam + cond_dim
+         self.init_to_token_mhr = nn.Linear(init_dim, self.cfg.MODEL.DECODER.DIM)
+@@ -108,6 +145,8 @@
+         )
+ 
+         # Create prompt encoder
++        # 提示可以是关节点或掩码。MAX_NUM_CLICKS 控制交互/采样提示历史容量，
++        # 不表示视频帧数；采样器也可用于训练时根据标注模拟点击纠正。
+         self.max_num_clicks = 0
+         if self.cfg.MODEL.PROMPT_ENCODER.ENABLE:
+             self.max_num_clicks = self.cfg.MODEL.PROMPT_ENCODER.MAX_NUM_CLICKS
+@@ -142,11 +181,13 @@
+                 dtype=np.float32,
+             )
+ 
++            # 冻结配置只关闭这里相应参数的梯度，不等于自动进入推理模式。
+             if self.cfg.MODEL.DECODER.FROZEN:
+                 for param in self.prompt_to_token.parameters():
+                     param.requires_grad = False
+ 
+         # Create promptable decoder
++        # 两个 Transformer 解码器使用同一配置分别实例化，参数彼此独立。
+         self.decoder = build_decoder(
+             self.cfg.MODEL.DECODER, context_dim=self.backbone.embed_dims
+         )
+@@ -157,6 +198,7 @@
+         self.hand_pe_layer = PositionEmbeddingRandom(self.backbone.embed_dims // 2)
+ 
+         # Manually convert the torso of the model to fp16.
++        # 半精度转换由基类实现，主要用于主干；不能理解为所有输出都采用 FP16。
+         if self.cfg.TRAIN.USE_FP16:
+             self.convert_to_fp16()
+             if self.cfg.TRAIN.get("FP16_TYPE", "float16") == "float16":
+@@ -166,6 +208,7 @@
+         else:
+             self.backbone_dtype = torch.float32
+ 
++        # 把每个裁剪像素对应的相机射线编码进图像特征，使模型感知裁剪位置与内参。
+         self.ray_cond_emb = CameraEncoder(
+             self.backbone.embed_dim,
+             self.backbone.patch_size,
+@@ -175,6 +218,7 @@
+             self.backbone.patch_size,
+         )
+ 
++        # 每个关键点一个可学习身份 token；其空间位置会在解码层之间继续更新。
+         self.keypoint_embedding_idxs = list(range(70))
+         self.keypoint_embedding = nn.Embedding(
+             len(self.keypoint_embedding_idxs), self.cfg.MODEL.DECODER.DIM
+@@ -184,6 +228,7 @@
+             len(self.keypoint_embedding_idxs_hand), self.cfg.MODEL.DECODER.DIM
+         )
+ 
++        # 额外两个 token 分别预测左右手的位置/大小，以及手部分类分数。
+         if self.cfg.MODEL.DECODER.get("DO_HAND_DETECT_TOKENS", False):
+             self.hand_box_embedding = nn.Embedding(
+                 2, self.cfg.MODEL.DECODER.DIM
+@@ -194,6 +239,7 @@
+                 self.cfg.MODEL.DECODER.DIM, self.cfg.MODEL.DECODER.DIM, 4, 3
+             )
+ 
++        # 2D 坐标经 FFN 映射到解码器维度；采样到的图像特征用单独线性层投影。
+         self.keypoint_posemb_linear = FFN(
+             embed_dims=2,
+             feedforward_channels=self.cfg.MODEL.DECODER.DIM,
+@@ -216,6 +262,7 @@
+         )
+ 
+         # Do all KPS
++        # 3D token 编码骨盆相对空间结构，与前面的 2D 图像位置 token 互补。
+         self.keypoint3d_embedding_idxs = list(range(70))
+         self.keypoint3d_embedding = nn.Embedding(
+             len(self.keypoint3d_embedding_idxs), self.cfg.MODEL.DECODER.DIM
+@@ -242,6 +289,9 @@
+             add_identity=False,
+         )
+ 
++    # 构造裁剪框的相机条件 [P,3]：((cx-c0x)/f, (cy-c0y)/f, 框宽/f)。
++    # c0 可取图像中心或内参主点；这里是无量纲几何条件，不是人体三维坐标。
++    # 'none' 分支返回 None；调用方是否兼容该配置需要单独检查。
+     def _get_decoder_condition(self, batch: Dict) -> Optional[torch.Tensor]:
+         num_person = batch["img"].shape[1]
+ 
+@@ -261,6 +311,7 @@
+                 .expand(-1, num_person, -1, -1)
+                 .contiguous()
+             )[:, 0, 0]
++            # 此条件使用 fx；USE_INTRIN_CENTER 决定偏移相对于主点还是图像中心。
+             if not self.cfg.MODEL.DECODER.get("USE_INTRIN_CENTER", False):
+                 condition_info = torch.cat(
+                     [cx - img_w / 2.0, cy - img_h / 2.0, b], dim=-1
+@@ -286,6 +337,9 @@
+ 
+         return condition_info.type(batch["img"].dtype)
+ 
++    # 身体解码器：图像特征 [P,C,h,w] + 初始姿态 + 可选关节点提示 -> 姿态结果。
++    # token_embeddings 存 token 内容；token_augment / image_augment 存附加位置等信息。
++    # 使用中间层预测时 pose_output 是逐层结果列表，调用方通常取最后一层 [-1]。
+     def forward_decoder(
+         self,
+         image_embeddings: torch.Tensor,
+@@ -312,6 +366,8 @@
+         batch_size = image_embeddings.shape[0]
+ 
+         # Initial estimation for residual prediction.
++        # 首次从可学习初值开始；下方回调依赖这里创建的 init_pose/init_camera。
++        # 当前主调用链传 init_estimate=None，不应把可选签名理解为已验证任意初值。
+         if init_estimate is None:
+             init_pose = self.init_pose.weight.expand(batch_size, -1).unsqueeze(dim=1)
+             if hasattr(self, "init_camera"):
+@@ -325,6 +381,7 @@
+                 else torch.cat([init_pose, init_camera], dim=-1)
+             )  # This is basically pose & camera translation at the end. B x 1 x (404 + 3)
+ 
++        # 将框/焦距条件与姿态、相机参数拼接后投影成一个 D 维姿态 token。
+         if condition_info is not None:
+             init_input = torch.cat(
+                 [condition_info.view(batch_size, 1, -1), init_estimate], dim=-1
+@@ -338,6 +395,8 @@
+         num_pose_token = token_embeddings.shape[1]
+         assert num_pose_token == 1
+ 
++        # 有提示时按顺序加入：当前姿态、上一轮估计、点击提示，再追加关节点 token。
++        # 首轮也会传一个 label=-2 的虚拟提示，保持相同的网络输入结构。
+         image_augment, token_augment, token_mask = None, None, None
+         if hasattr(self, "prompt_encoder") and keypoints is not None:
+             if prev_estimate is None:
+@@ -348,6 +407,7 @@
+                 batch_size, 1, -1
+             )  # 407 -> B x 1 x 1024; linear layer-ed
+ 
++            # 特定 ViT 使用非正方形特征图，因此位置编码也要裁掉相同的左右区域。
+             if self.cfg.MODEL.BACKBONE.TYPE in [
+                 "vit_hmr",
+                 "vit",
+@@ -372,6 +432,8 @@
+ 
+             image_embeddings = self.ray_cond_emb(image_embeddings, batch["ray_cond"])
+ 
++            # 每个提示为 (x,y,label)：x/y 在 [0,1]；非负 label 指关键点编号。
++            # -1 和 -2 使用特殊嵌入；返回的 prompt_mask 在此没有赋给 token_mask。
+             # To start, keypoints is all [0, 0, -2]. The points get sent into self.pe_layer._pe_encoding,
+             # the labels determine the embedding weight (special one for -2, -1, then each of joint.)
+             prompt_embeddings, prompt_mask = self.prompt_encoder(
+@@ -419,6 +481,7 @@
+                     dim=1,
+                 )  # B x 5 + 70 x 1024
+ 
++            # 记录各组 token 的起始位置，供逐层回调准确更新对应关节点而不覆盖姿态。
+             assert self.cfg.MODEL.DECODER.get("DO_KEYPOINT_TOKENS", False)
+             # Put in a token for each keypoint
+             kps_emb_start_idx = token_embeddings.shape[1]
+@@ -461,6 +524,8 @@
+                 )  # B x 3 + 70 + 70 x 1024
+ 
+         # We're doing intermediate model predictions
++        # 解码器每层可调用此函数：读取第 0 个姿态 token，回归 MHR 和相机参数。
++        # prev_pose_output/layer_idx 是回调接口参数，本实现仍以可学习初值作残差基准。
+         def token_to_pose_output_fn(tokens, prev_pose_output, layer_idx):
+             # Get the pose token
+             pose_token = tokens[:, 0]
+@@ -490,6 +555,8 @@
+         kp3d_token_update_fn = self.keypoint3d_token_update_fn
+ 
+         # Combine the 2D and 3D functionse
++        # 按顺序更新 2D 特征和 3D 结构，再交给下一层解码器继续细化。
++        # 对应 token 起始索引只在配置分支中创建，使用时需保持 checkpoint 配置一致。
+         def keypoint_token_update_fn_comb(*args):
+             if kp_token_update_fn is not None:
+                 args = kp_token_update_fn(kps_emb_start_idx, image_embeddings, *args)
+@@ -497,6 +564,7 @@
+                 args = kp3d_token_update_fn(kps3d_emb_start_idx, *args)
+             return args
+ 
++        # 主干特征作为交叉注意力上下文；两个回调形成“预测 -> 更新 token”的层间反馈。
+         pose_token, pose_output = self.decoder(
+             token_embeddings,
+             image_embeddings,
+@@ -507,6 +575,7 @@
+             keypoint_token_update_fn=keypoint_token_update_fn_comb,
+         )
+ 
++        # 开启手框检测时首个返回值只保留左右手 token，供后续 bbox/classification 头使用。
+         if self.cfg.MODEL.DECODER.get("DO_HAND_DETECT_TOKENS", False):
+             return (
+                 pose_token[:, hand_det_emb_start_idx : hand_det_emb_start_idx + 2],
+@@ -515,6 +584,9 @@
+         else:
+             return pose_token, pose_output
+ 
++    # 手部解码器：结构与身体解码器相似，但使用独立的手部头、token 和射线编码。
++    # full 模式把左手镜像为右手外观后也送入此分支，随后再恢复左右对应关系。
++    # 参数与返回结构参见 forward_decoder；这里的 batch 索引使用 hand_batch_idx。
+     def forward_decoder_hand(
+         self,
+         image_embeddings: torch.Tensor,
+@@ -542,6 +614,7 @@
+ 
+         # Initial estimation for residual prediction.
+         if init_estimate is None:
++            # 使用手部分支自己的姿态/相机初值，不能直接替换为身体分支的 token。
+             init_pose = self.init_pose_hand.weight.expand(batch_size, -1).unsqueeze(
+                 dim=1
+             )
+@@ -562,6 +635,7 @@
+             )  # B x 1 x 410 (this is with the CLIFF condition)
+         else:
+             init_input = init_estimate
++        # 将几何条件与手部初始参数压缩为一个姿态 token。
+         token_embeddings = self.init_to_token_mhr_hand(init_input).view(
+             batch_size, 1, -1
+         )  # B x 1 x 1024 (linear layered)
+@@ -584,6 +658,7 @@
+                 "vit_l",
+             ]:
+                 # ViT backbone assumes a different aspect ratio as input size
++                # 手部使用自己的随机位置编码层，裁剪范围与主干特征图对齐。
+                 image_augment = self.hand_pe_layer((16, 16)).unsqueeze(0)[:, :, :, 2:-2]
+             elif self.cfg.MODEL.BACKBONE.TYPE in [
+                 "vit_hmr_512_384",
+@@ -597,6 +672,7 @@
+                     0
+                 )  # (1, C, H, W)
+ 
++            # 手部框在原图中的位置不同，必须使用该框对应的相机射线。
+             image_embeddings = self.ray_cond_emb_hand(
+                 image_embeddings, batch["ray_cond_hand"]
+             )
+@@ -654,6 +730,8 @@
+             token_embeddings = torch.cat(
+                 [
+                     token_embeddings,
++                    # 保留 70 个关键点身份；手部头将右手 21~41 以外的三维点置零。
++                    # 因此保留该输出维度不代表手部分支恢复了有效的完整人体。
+                     self.keypoint_embedding_hand.weight[None, :, :].repeat(
+                         batch_size, 1, 1
+                     ),
+@@ -675,6 +753,7 @@
+                 token_embeddings = torch.cat(
+                     [
+                         token_embeddings,
++                        # 可选的 3D 关键点 token，与二维投影 token 分开维护。
+                         self.keypoint3d_embedding_hand.weight[None, :, :].repeat(
+                             batch_size, 1, 1
+                         ),
+@@ -701,6 +780,7 @@
+             prev_camera = init_camera.view(batch_size, -1)
+ 
+             # Get pose outputs
++            # 每层都从姿态 token 解出手部分支参数，然后投影到原图和手部裁剪图。
+             pose_output = self.head_pose_hand(pose_token, prev_pose)
+ 
+             # Get Camera Translation
+@@ -717,6 +797,7 @@
+ 
+             return pose_output
+ 
++        # 两个回调分别反馈局部图像证据和骨盆相对三维结构，使用手部分支参数。
+         kp_token_update_fn = self.keypoint_token_update_fn_hand
+ 
+         # Now for 3D
+@@ -730,6 +811,7 @@
+                 args = kp3d_token_update_fn(kps3d_emb_start_idx, *args)
+             return args
+ 
++        # 与身体分支一样，返回逐层预测；上层 forward_pose_branch 取最后一层。
+         pose_token, pose_output = self.decoder_hand(
+             token_embeddings,
+             image_embeddings,
+@@ -748,6 +830,8 @@
+         else:
+             return pose_token, pose_output
+ 
++    # 根据当前预测与 batch 中的参考关键点采样下一次提示，常用于模拟交互纠正。
++    # force_dummy 可强制生成占位提示；本函数不向采样过程传播梯度。
+     @torch.no_grad()
+     def _get_keypoint_prompt(self, batch, pred_keypoints_2d, force_dummy=False):
+         if self.camera_type == "perspective":
+@@ -763,6 +847,9 @@
+         )
+         return keypoint_prompt
+ 
++    # 将人物掩码编码成与图像特征同分辨率的条件特征 [P,C,h,w]。
++    # 有效 mask 用 mask_score 缩放；无效 mask 使用学习到的“无掩码”嵌入。
++    # 这是条件输入，不是调用 SAM/SAM2 进行图像分割；分割由外层 Estimator 完成。
+     def _get_mask_prompt(self, batch, image_embeddings):
+         x_mask = self._flatten_person(batch["mask"])
+         mask_embeddings, no_mask_embeddings = self.prompt_encoder.get_mask_embeddings(
+@@ -788,6 +875,10 @@
+         )
+         return mask_embeddings
+ 
++    # 一轮提示采样/纠正辅助流程：复用图像特征，把已有预测编码成上一轮估计。
++    # prev_prompt 是同一图片上的点击历史，并不是视频前一帧的运动状态。
++    # 当前 run_inference 的 full 路径使用下面的 run_keypoint_prompt；此辅助路径
++    # 的 forward_decoder 调用带有 full_output，使用前需核对当前版本的接口兼容性。
+     def _one_prompt_iter(self, batch, output, prev_prompt, full_output):
+         image_embeddings = output["image_embeddings"]
+         condition_info = output["condition_info"]
+@@ -843,6 +934,7 @@
+             )
+             kpt_shape = pred_keypoints_2d_hand.shape[1:]
+ 
++        # 把身体/手部分支结果按各自索引放回统一裁剪批次，便于一致地采样提示。
+         all_prev_estimate = torch.zeros(
+             (image_embeddings.shape[0], *prev_shape), device=image_embeddings.device
+         )
+@@ -860,6 +952,7 @@
+         if "mhr_hand" in output and output["mhr_hand"] is not None:
+             all_pred_keypoints_2d[self.hand_batch_idx] = pred_keypoints_2d_hand
+ 
++        # 新提示与历史提示累积，不重新提取整张图片的主干特征。
+         keypoint_prompt = self._get_keypoint_prompt(batch, all_pred_keypoints_2d)
+         if len(prev_prompt):
+             cur_keypoint_prompt = torch.cat(prev_prompt + [keypoint_prompt], dim=1)
+@@ -889,6 +982,9 @@
+ 
+         return output, keypoint_prompt
+ 
++    # 原图像素 [P,J,2] -> 裁剪归一化坐标 [P,J,2]。
++    # 先补齐次坐标并右乘仿射矩阵转置，再除裁剪尺寸并减 0.5。
++    # batch_idx 用来选择身体/手部子批次；越界点仍保留，后续再判定是否有效。
+     def _full_to_crop(
+         self,
+         batch: Dict,
+@@ -914,6 +1010,10 @@
+ 
+         return pred_keypoints_2d_cropped
+ 
++    # 身体投影：将 pred_cam=(s,tx,ty) 换成 pred_cam_t=(tx,ty,tz)，
++    # 将未平移的三维点加 pred_cam_t，再用 K 投影成原图像素。
++    # 同时返回焦距与各点深度；这里不对 pred_keypoints_3d 本身加平移。
++    # 返回字典会原地补充字段，保留 MHR 的原始三维输出以供下游处理。
+     def camera_project(self, pose_output: Dict, batch: Dict) -> Dict:
+         """
+         Project 3D keypoints to 2D using the camera parameters.
+@@ -944,6 +1044,7 @@
+             use_intrin_center=self.cfg.MODEL.DECODER.get("USE_INTRIN_CENTER", False),
+         )
+ 
++        # 若输出包含网格，使用相同相机参数计算所有网格顶点的二维投影。
+         if pose_output.get("pred_vertices", None) is not None:
+             cam_out_vertices = head_camera.perspective_projection(
+                 pose_output["pred_vertices"],
+@@ -969,6 +1070,8 @@
+ 
+         return pose_output
+ 
++    # 手部投影与身体相同，但必须选择 hand_batch_idx 的框和手部分支相机头。
++    # 内参仍属于原图；不能直接把手部裁剪的像素位置当成原图像素。
+     def camera_project_hand(self, pose_output: Dict, batch: Dict) -> Dict:
+         """
+         Project 3D keypoints to 2D using the camera parameters.
+@@ -1024,6 +1127,10 @@
+ 
+         return pose_output
+ 
++    # 为每个裁剪像素构造射线横纵分量 ((u-cx)/fx, (v-cy)/fy)。
++    # 输出 [B,N,2,H,W]，可理解为方向 (x,y,1) 的前两项，不含深度或世界位置。
++    # 这里通过仿射矩阵的对角缩放和平移还原原图位置，假定裁剪不含旋转/剪切；
++    # 原实现直接调用 .cuda()，并非任意设备上的通用实现。
+     def get_ray_condition(self, batch):
+         B, N, _, H, W = batch["img"].shape
+         meshgrid_xy = (
+@@ -1042,6 +1149,7 @@
+             / batch["affine_trans"][:, :, None, None, [0, 1], [0, 1]]
+         )
+ 
++        # 原图像素减内参主点，再分别除 fx/fy；这里的射线没有归一化成单位长度。
+         # Subtract out center & normalize to be rays
+         meshgrid_xy = (
+             meshgrid_xy - batch["cam_int"][:, None, None, None, [0, 1], [2, 2]]
+@@ -1054,11 +1162,15 @@
+             batch["img"].dtype
+         )  # This is B x num_person x 2 x H x W
+ 
++    # 一次裁剪批次的完整前向：归一化图片 -> 主干特征 -> 提示/几何条件 -> 解码。
++    # body_batch_idx 和 hand_batch_idx 由 forward_step 设置，用来分配解码分支。
++    # 返回 mhr/mhr_hand 以及可复用的图像特征和框条件，供后续提示细化。
+     def forward_pose_branch(self, batch: Dict) -> Dict:
+         """Run a forward pass for the crop-image (pose) branch."""
+         batch_size, num_person = batch["img"].shape[:2]
+ 
+         # Forward backbone encoder
++        # 把 B、N 两个维度展开为 P；像素归一化与特殊 ViT 的宽度裁剪在基类中完成。
+         x = self.data_preprocess(
+             self._flatten_person(batch["img"]),
+             crop_width=(
+@@ -1092,12 +1204,14 @@
+             batch["ray_cond"] = ray_cond[self.body_batch_idx].clone()
+         if len(self.hand_batch_idx):
+             batch["ray_cond_hand"] = ray_cond[self.hand_batch_idx].clone()
++        # 射线已按分支存入 batch，稍后在解码器前融合；这里不给主干 extra_embed。
+         ray_cond = None
+ 
+         image_embeddings = self.backbone(
+             x.type(self.backbone_dtype), extra_embed=ray_cond
+         )  # (B, C, H, W)
+ 
++        # 兼容返回多级特征的主干，只选择最后一项，并恢复后续解码所用精度。
+         if isinstance(image_embeddings, tuple):
+             image_embeddings = image_embeddings[-1]
+         image_embeddings = image_embeddings.type(x.dtype)
+@@ -1115,6 +1229,7 @@
+         condition_info = self._get_decoder_condition(batch)
+ 
+         # Initial estimate with a dummy prompt
++        # 虚拟点 [0,0,-2] 表示没有人工纠正；首次推理也走提示解码器的同一结构。
+         keypoints_prompt = torch.zeros((batch_size * num_person, 1, 3)).to(batch["img"])
+         keypoints_prompt[:, :, -1] = -2
+ 
+@@ -1141,6 +1256,7 @@
+             )
+             pose_output_hand = pose_output_hand[-1]
+ 
++        # 未执行的分支为 None；mhr 是身体结果，mhr_hand 是手部分支结果。
+         output = {
+             # "pose_token": pose_token,
+             "mhr": pose_output,  # mhr prediction output
+@@ -1152,6 +1268,8 @@
+         if self.cfg.MODEL.DECODER.get("DO_HAND_DETECT_TOKENS", False):
+             if len(self.body_batch_idx):
+                 output_hand_box_tokens = tokens_output
++                # sigmoid 将框的四个量限制到 [0,1]；_get_hand_box 再还原到原图。
++                # 下游按前两维为中心、后两维为尺寸读取，修改编码时须同步核对。
+                 hand_coords = self.bbox_embed(
+                     output_hand_box_tokens
+                 ).sigmoid()  # x1, y1, w, h for body samples, 0 ~ 1
+@@ -1175,6 +1293,9 @@
+ 
+         return output
+ 
++    # 根据 decoder_type 把所有 P 个裁剪分配给身体或手部解码器，再做一次前向。
++    # 实际返回一个 output 字典（不是类型注解所写的两个字典）。
++    # 目前未知类型的分支仅构造 ValueError、没有 raise，不能依赖它完成参数校验。
+     def forward_step(
+         self, batch: Dict, decoder_type: str = "body"
+     ) -> Tuple[Dict, Dict]:
+@@ -1194,6 +1315,12 @@
+ 
+         return pose_output
+ 
++    # 外部主要推理入口。img 是整张 RGB 原图，batch 是已经预处理的人体裁剪批次。
++    # body：只运行身体解码器，仍输出完整人体；hand：结果保存在 mhr_hand；
++    # full：身体初估 -> 左/右手细化 -> 有效性筛选 -> 提示身体 -> 手腕融合 -> 重算几何。
++    # body/hand 返回字典；full 返回五项元组，含最终身体结果和双手的批次/分支结果。
++    # thresh_wrist_angle 单位为弧度，只用于融合筛选，不是机器人关节角限制。
++    # 本函数没有时序滤波，也不在内部执行相机运动补偿或世界坐标重建。
+     def run_inference(
+         self,
+         img,
+@@ -1214,6 +1341,8 @@
+         height, width = img.shape[:2]
+         cam_int = batch["cam_int"].clone()
+ 
++        # body/hand 模式在此直接结束；后面的双手融合仅属于 full 模式。
++        # 未知 inference_type 的原分支没有 raise，调用方应传入上述三个有效值。
+         if inference_type == "body":
+             pose_output = self.forward_step(batch, decoder_type="body")
+             return pose_output
+@@ -1224,8 +1353,11 @@
+             ValueError("Invalid inference type: ", inference_type)
+ 
+         # Step 1. For full-body inference, we first inference with the body decoder.
++        # 第 1 阶段：身体初估提供全身结构、左右手框和原始手腕朝向。
+         pose_output = self.forward_step(batch, decoder_type="body")
+         left_xyxy, right_xyxy = self._get_hand_box(pose_output, batch)
++        # [41,43,42,31,33,32] 是 body_pose 参数槽位，以 XZY 顺序读取左右手腕。
++        # 它们不是 70 个输出关键点的编号；这里每只手取 3 个局部欧拉角。
+         ori_local_wrist_rotmat = roma.euler_to_rotmat(
+             "XZY",
+             pose_output["mhr"]["body_pose"][:, [41, 43, 42, 31, 33, 32]].unflatten(
+@@ -1235,6 +1367,8 @@
+ 
+         # Step 2. Re-run with each hand
+         ## Left... Flip image & box
++        # 第 2 阶段：左手先水平镜像，以复用右手外观的手部分支。
++        # 原图 x 的镜像公式为 width-1-x；xyxy 框两侧同时交换。
+         flipped_img = img[:, ::-1]
+         tmp = left_xyxy.copy()
+         left_xyxy[:, 0] = width - tmp[:, 2] - 1
+@@ -1249,6 +1383,8 @@
+         # Unflip output
+         ## Flip scale
+         ### Get MHR values
++        # MHR 的左右手尺度使用不同均值/标准差：先还原右手尺度，再编码为左手尺度。
++        # scale 的第 8/9 项对应右/左手，不能简单交换标准化后的数值。
+         scale_r_hands_mean = self.head_pose.scale_mean[8].item()
+         scale_l_hands_mean = self.head_pose.scale_mean[9].item()
+         scale_r_hands_std = self.head_pose.scale_comps[8, 8].item()
+@@ -1262,11 +1398,13 @@
+             - scale_l_hands_mean
+         ) / scale_l_hands_std
+         ## Get the right hand global rotation, flip it, put it in as left.
++        # 42/78 是 MHR 骨骼的右/左手腕索引；恢复左手时还要转换旋转的坐标约定。
+         lhand_output["mhr_hand"]["joint_global_rots"][:, 78] = lhand_output["mhr_hand"][
+             "joint_global_rots"
+         ][:, 42].clone()
+         lhand_output["mhr_hand"]["joint_global_rots"][:, 78, [1, 2], :] *= -1
+         ### Flip hand pose
++        # hand 参数前 54 维是左手，后 54 维是右手；把镜像推理的右手参数放回左侧。
+         lhand_output["mhr_hand"]["hand"][:, :54] = lhand_output["mhr_hand"]["hand"][
+             :, 54:
+         ]
+@@ -1276,6 +1414,7 @@
+         )
+ 
+         ## Right...
++        # 右手直接在原图上裁剪，不需要镜像；两手均沿用同一原图相机内参。
+         batch_rhand = prepare_batch(
+             img, transform_hand, right_xyxy, cam_int=cam_int.clone()
+         )
+@@ -1284,6 +1423,9 @@
+ 
+         # Step 3. replace hand pose estimation from the body decoder.
+         ## CRITERIA 1: LOCAL WRIST POSE DIFFERENCE
++        # 第 3 阶段：判断手部细化是否可信，避免把不合理手势直接写回全身。
++        # 第一项：结合前臂和绑定姿态，换算手部分支要求的局部手腕旋转，
++        # 与身体初估比较旋转角差；rotation_angle_difference 返回 [P,2] 弧度值。
+         joint_rotations = pose_output["mhr"]["joint_global_rots"]
+         ### Get lowarm
+         lowarm_joint_idxs = torch.LongTensor([76, 40]).cuda()  # left, right
+@@ -1314,6 +1456,7 @@
+         angle_difference_valid_mask = angle_difference < thresh_wrist_angle
+ 
+         ## CRITERIA 2: hand box size
++        # 第二项：左右手裁剪框在原图中的宽/高都必须大于 64 像素。
+         hand_box_size_thresh = 64
+         hand_box_size_valid_mask = torch.stack(
+             [
+@@ -1328,6 +1471,8 @@
+         )
+ 
+         ## CRITERIA 3: all hand 2D KPS (including wrist) inside of box.
++        # 第三项：手部分支返回的投影点应落在裁剪范围内。
++        # 代码对整个返回张量做最大值检查，坐标绝对值必须小于 0.5。
+         hand_kps2d_thresh = 0.5
+         hand_kps2d_valid_mask = torch.stack(
+             [
+@@ -1344,6 +1489,8 @@
+         )
+ 
+         ## CRITERIA 4: 2D wrist distance.
++        # 第四项：身体/手部分支的二维手腕位置差，相对框尺度小于 0.25。
++        # 这里 41/62 是 MHR70 的右/左手腕关键点；镜像左手输出仍先取右手腕 41。
+         hand_wrist_kps2d_thresh = 0.25
+         kps_right_wrist_idx = 41
+         kps_left_wrist_idx = 62
+@@ -1360,6 +1507,8 @@
+         body_left_kps_full = pose_output["mhr"]["pred_keypoints_2d"][
+             :, [kps_left_wrist_idx]
+         ].clone()
++        # 按当前原实现，右侧距离除左框尺度、左侧距离除右框尺度；修改时应核对此约定。
++        # 此次仅增加说明，保留原有筛选公式。
+         right_kps_dist = (right_kps_full - body_right_kps_full).flatten(0, 1).norm(
+             dim=-1
+         ) / batch_lhand["bbox_scale"].flatten(0, 1)[:, 0]
+@@ -1374,6 +1523,7 @@
+             dim=1,
+         )
+         ## Left-right
++        # 四个条件必须同时满足；hand_valid_mask 的两列按 [左手, 右手] 排列。
+         hand_valid_mask = (
+             angle_difference_valid_mask
+             & hand_box_size_valid_mask
+@@ -1384,6 +1534,8 @@
+         # Keypoint prompting with the body decoder.
+         # We use the wrist location from the hand decoder and the elbow location
+         # from the body decoder as prompts to get an updated body pose estimation.
++        # 第 4 阶段：手部分支给手腕、身体分支给手肘，组成提示再次细化身体。
++        # 重新切回身体批次索引；复用原先的身体图像特征，不再运行一次主干。
+         batch_size, num_person = batch["img"].shape[:2]
+         self.hand_batch_idx = []
+         self.body_batch_idx = list(range(batch_size * num_person))
+@@ -1418,6 +1570,7 @@
+         left_kps_elbow_crop = self._full_to_crop(batch, left_kps_elbow_full)
+ 
+         # Assemble them into keypoint prompts
++        # 每个提示最后一维为 (x,y,关键点编号)，顺序是右腕、左腕、右肘、左肘。
+         keypoint_prompt = torch.cat(
+             [right_kps_crop, left_kps_crop, right_kps_elbow_crop, left_kps_elbow_crop],
+             dim=1,
+@@ -1430,6 +1583,8 @@
+         keypoint_prompt[:, 2, -1] = kps_right_elbow_idx
+         keypoint_prompt[:, 3, -1] = kps_left_elbow_idx
+ 
++        # 多人批次必须保持相同提示数，无效点用 label=-2 占位；单人可以直接删除。
++        # 同时将裁剪坐标从 [-0.5,0.5] 平移到提示编码器要求的 [0,1]。
+         if keypoint_prompt.shape[0] > 1:
+             # Replace invalid keypoints to dummy prompts
+             invalid_prompt = (
+@@ -1468,6 +1623,8 @@
+         ##############################################################################
+ 
+         # Drop in hand pose
++        # 第 5 阶段：组合左右手的姿态、尺度与形状，先构造待融合的候选参数。
++        # 最终写入时仍使用有效性掩码；这里的候选平均不代表无条件接受两只手。
+         left_hand_pose_params = lhand_output["mhr_hand"]["hand"][:, :54]
+         right_hand_pose_params = rhand_output["mhr_hand"]["hand"][:, 54:]
+         updated_hand_pose = torch.cat(
+@@ -1493,6 +1650,9 @@
+         ############################ Doing IK ############################
+ 
+         # First, forward just FK
++        # 先用候选手部参数做 MHR 正向运动学，得到当前前臂的全局旋转。
++        # 这段 IK 只处理人体模型中的手腕连接，与后续 MuJoCo G1 的重定向 IK 无关。
++        # global_trans 设为零：此处只生成模型几何，相机平移在最后投影时单独加入。
+         joint_rotations = self.head_pose.mhr_forward(
+             global_trans=pose_output["mhr"]["global_rot"] * 0,
+             global_rot=pose_output["mhr"]["global_rot"],
+@@ -1530,6 +1690,7 @@
+         fused_local_wrist_rotmat = torch.einsum(
+             "kabc,kabd->kadc", pred_global_wrist_rotmat, wrist_zero_rot_pose
+         )
++        # 把目标手腕全局旋转转为相对前臂的局部 XZY 欧拉角，再按人体手腕规则修正。
+         wrist_xzy = fix_wrist_euler(
+             roma.rotmat_to_euler("XZY", fused_local_wrist_rotmat)
+         )
+@@ -1538,6 +1699,7 @@
+         angle_difference = rotation_angle_difference(
+             ori_local_wrist_rotmat, fused_local_wrist_rotmat
+         )  # B x 2 x 3 x3
++        # 再次检查角差并与前述四项门限相交；失败的一侧保留身体分支原预测。
+         valid_angle = angle_difference < thresh_wrist_angle
+         valid_angle = valid_angle & hand_valid_mask
+         valid_angle = valid_angle.unsqueeze(-1)
+@@ -1569,6 +1731,8 @@
+         pose_output["mhr"]["scale"][:, 8] = masked_hand_scale[:, 1]
+ 
+         # Replace shared shape and scale
++        # 共享的手部形状/尺度只对通过筛选的手求平均；两手都无效时保留原值。
++        # 分母加 1e-8 是数值保护，不能作为某只手通过筛选的证据。
+         pose_output["mhr"]["scale"][:, 18:] = torch.where(
+             valid_angle.squeeze(-1).sum(dim=1, keepdim=True) > 0,
+             (
+@@ -1595,6 +1759,7 @@
+         ########################################################
+ 
+         # Re-run forward
++        # 第 6 阶段：根据融合后的参数重算网格和关节点，避免几何仍对应旧姿态。
+         with torch.no_grad():
+             verts, j3d, jcoords, mhr_model_params, joint_global_rots = (
+                 self.head_pose.mhr_forward(
+@@ -1612,12 +1777,16 @@
+                 )
+             )
+             j3d = j3d[:, :70]  # 308 --> 70 keypoints
++            # MHR 几何转换为本项目投影使用的轴方向：y 向下、z 向前。
++            # 此时仍没有加 pred_cam_t，更没有乘相机到世界的外参。
+             verts[..., [1, 2]] *= -1  # Camera system difference
+             j3d[..., [1, 2]] *= -1  # Camera system difference
+             jcoords[..., [1, 2]] *= -1
+             pose_output["mhr"]["pred_keypoints_3d"] = j3d
+             pose_output["mhr"]["pred_vertices"] = verts
+             pose_output["mhr"]["pred_joint_coords"] = jcoords
++            # 融合后的欧拉参数已不再对应原始连续回归向量，因此原代码将其置零。
++            # 下游应使用更新后的 body_pose/hand 等参数，不能将这个零向量当成静止姿态。
+             pose_output["mhr"]["pred_pose_raw"][
+                 ...
+             ] = 0  # pred_pose_raw is not valid anymore
+@@ -1625,6 +1794,10 @@
+ 
+         ########################################################
+         # Project to 2D
++        # 第 7 阶段：用更新后的三维点和已有相机平移重新投影。
++        # 注意 full 路径这里用单一 focal_length 与 (width/2,height/2)，
++        # 不完全等同于前面 camera_project 的一般 K 投影；非中心主点/不同 fx、fy
++        # 的标定相机若使用 full 模式，需要核对这里的简化假设。
+         pred_keypoints_3d_proj = (
+             pose_output["mhr"]["pred_keypoints_3d"]
+             + pose_output["mhr"]["pred_cam_t"][:, None, :]
+@@ -1644,13 +1817,19 @@
+         )
+         pose_output["mhr"]["pred_keypoints_2d"] = pred_keypoints_3d_proj[:, :, :2]
+ 
++        # 返回两手分支输出与裁剪批次（左手已做镜像还原），供 Estimator 整理手框等结果。
+         return pose_output, batch_lhand, batch_rhand, lhand_output, rhand_output
+ 
++    # 用明确给定的关键点提示细化同一张图片，复用已有主干特征。
++    # keypoint_prompt 为 [P,K,3]，前两维归一化到 [0,1]，第三维是提示标签。
++    # 上一轮预测作为单独的 prev_estimate token，主姿态 token 仍从可学习初值开始。
+     def run_keypoint_prompt(self, batch, output, keypoint_prompt):
+         image_embeddings = output["image_embeddings"]
+         condition_info = output["condition_info"]
+         pose_output = output["mhr"]  # body-only output
+         # Use previous estimate as initialization
++        # 拼接顺序必须与模型的回归参数约定一致；detach 切断上一轮预测的梯度链。
++        # pred_pose_raw 包含全局旋转的 6D 表示和连续身体姿态，并不只有 6 个数。
+         prev_estimate = torch.cat(
+             [
+                 pose_output["pred_pose_raw"].detach(),  # (B, 6)
+@@ -1680,6 +1859,10 @@
+         output.update({"mhr": pose_output})
+         return output, keypoint_prompt
+ 
++    # 身体解码器的归一化手框 -> 原图 xyxy 边界框，返回左右两组 [N,4] numpy 数组。
++    # 当前实现将 hand_box 前两维当中心、后两维当尺寸，并取最大边生成正方形。
++    # 使用 batch 第 0 张图片的仿射变换，适配 Estimator 每次处理一张图的调用方式；
++    # 这里通过缩放/平移反变换，不是任意旋转仿射矩阵的通用逆变换。
+     def _get_hand_box(self, pose_output, batch):
+         """Get hand bbox from the hand detector"""
+         pred_left_hand_box = (
+@@ -1702,6 +1885,7 @@
+         )
+ 
+         # Crop to full. batch["affine_trans"] is full-to-crop, right application
++        # 尺度只需除缩放系数；中心则先减平移再除缩放，回到原图像素空间。
+         batch["left_scale"] = (
+             batch["left_scale"]
+             / batch["affine_trans"][0, :, 0, 0].cpu().numpy()[:, None]
+@@ -1719,6 +1903,7 @@
+             - batch["affine_trans"][0, :, [0, 1], [2, 2]].cpu().numpy()
+         ) / batch["affine_trans"][0, :, 0, 0].cpu().numpy()[:, None]
+ 
++        # 中心 ± 半边长得到 (xmin,ymin,xmax,ymax)；函数内没有额外裁剪到图像边界。
+         left_xyxy = np.concatenate(
+             [
+                 (
+@@ -1756,6 +1941,9 @@
+ 
+         return left_xyxy, right_xyxy
+ 
++    # 身体分支的 2D 层间反馈：用当前预测位置采样图像特征，更新每个关键点 token。
++    # 同时把二维位置编码写入 token_augment；起始索引用于定位 70 个关键点的槽位。
++    # 返回值沿用解码器回调协议，供同一轮中的 3D 更新函数继续处理。
+     def keypoint_token_update_fn(
+         self,
+         kps_emb_start_idx,
+@@ -1766,6 +1954,7 @@
+         layer_idx,
+     ):
+         # It's already after the last layer, we're done.
++        # 最后一层之后没有下一层需要读取这些 token，直接返回即可。
+         if layer_idx == len(self.decoder.layers) - 1:
+             return token_embeddings, token_augment, pose_output, layer_idx
+ 
+@@ -1792,6 +1981,7 @@
+         pred_keypoints_2d_cropped_01 = pred_keypoints_2d_cropped + 0.5
+ 
+         # Get a mask of those that are 1) beyond image boundaries or 2) behind the camera
++        # 这里只排除裁剪外或深度过小/在相机后的点，并不判断人体遮挡或检测置信度。
+         invalid_mask = (
+             (pred_keypoints_2d_cropped_01[:, :, 0] < 0)
+             | (pred_keypoints_2d_cropped_01[:, :, 0] > 1)
+@@ -1801,6 +1991,7 @@
+         )
+ 
+         # Run them through the prompt encoder's pos emb function
++        # 将 [-0.5,0.5] 范围的预测位置映射到 D 维，并将无效点的位置编码清零。
+         token_augment[:, kps_emb_start_idx : kps_emb_start_idx + num_keypoints, :] = (
+             self.keypoint_posemb_linear(pred_keypoints_2d_cropped)
+             * (~invalid_mask[:, :, None])
+@@ -1825,6 +2016,8 @@
+             )
+ 
+         # Version 2 is projecting & bilinear sampling
++        # grid_sample 输入为 [-1,1] 的 xy 坐标；输出整理成 [P,J,C]。
++        # 这是在深层特征图上双线性取样，不是重新裁剪原图或运行主干。
+         pred_keypoints_2d_cropped_feats = (
+             F.grid_sample(
+                 image_embeddings,
+@@ -1841,6 +2034,7 @@
+             ~invalid_mask[:, :, None]
+         )
+         # This is ADDING
++        # 残差相加保留原 token 的内容，再补充该位置的局部图像证据。
+         token_embeddings = token_embeddings.clone()
+         token_embeddings[
+             :,
+@@ -1850,6 +2044,8 @@
+ 
+         return token_embeddings, token_augment, pose_output, layer_idx
+ 
++    # 身体分支的 3D 层间反馈：用当前预测的骨盆相对三维点更新位置编码。
++    # 不采样图像、不修改输出三维点，也不把人体根位置固定到世界原点。
+     def keypoint3d_token_update_fn(
+         self,
+         kps3d_emb_start_idx,
+@@ -1868,6 +2064,7 @@
+         pred_keypoints_3d = pose_output["pred_keypoints_3d"].clone()
+ 
+         # Now, pelvis normalize
++        # 减去左右髋中点只消除整体平移；不会缩放骨长、纠正重力或确定世界朝向。
+         pred_keypoints_3d = (
+             pred_keypoints_3d
+             - (
+@@ -1881,6 +2078,7 @@
+         pred_keypoints_3d = pred_keypoints_3d[:, self.keypoint3d_embedding_idxs]
+ 
+         # Run through embedding MLP & put in
++        # [P,J,3] 经 MLP 变为 [P,J,D]，替换这一组 token 的附加位置编码。
+         token_augment = token_augment.clone()
+         token_augment[
+             :,
+@@ -1890,6 +2088,8 @@
+ 
+         return token_embeddings, token_augment, pose_output, layer_idx
+ 
++    # 手部分支的 2D 层间反馈：算法与身体版本相同，但使用手部 token 和投影层。
++    # 此时裁剪归一化坐标属于手框，不能混入身体裁剪下的二维坐标。
+     def keypoint_token_update_fn_hand(
+         self,
+         kps_emb_start_idx,
+@@ -1907,6 +2107,8 @@
+         token_embeddings = token_embeddings.clone()
+         token_augment = token_augment.clone()
+ 
++        # 关键点数由手部分支嵌入表决定，当前初始化为 70，不能硬当成 21 个手点。
++        # 手部头只保留右手 21~41 的三维点，其余三维点为零，但这里仍处理整个输出张量。
+         num_keypoints = self.keypoint_embedding_hand.weight.shape[0]
+ 
+         # Get current 2D KPS predictions
+@@ -1936,6 +2138,7 @@
+ 
+         # Run them through the prompt encoder's pos emb function
+         token_augment[:, kps_emb_start_idx : kps_emb_start_idx + num_keypoints, :] = (
++            # 手部分支有独立的位置映射参数；无效采样位置沿用同样的清零门限。
+             self.keypoint_posemb_linear_hand(pred_keypoints_2d_cropped)
+             * (~invalid_mask[:, :, None])
+         )
+@@ -1976,6 +2179,7 @@
+         )
+         # This is ADDING
+         token_embeddings = token_embeddings.clone()
++        # 用手部分支的线性层将采样特征从 C 维转换到 token 的 D 维。
+         token_embeddings[
+             :,
+             kps_emb_start_idx : kps_emb_start_idx + num_keypoints,
+@@ -1984,6 +2188,9 @@
+ 
+         return token_embeddings, token_augment, pose_output, layer_idx
+ 
++    # 手部分支的 3D 层间反馈，沿用减去 MHR70 左右髋中点的统一公式。
++    # 手部头把非右手关键点（包括左右髋）置零，因此这里的髋中点也是零。
++    # 70 点仅为统一输出结构，不能据此把手部结果解释成有效的全身姿态。
+     def keypoint3d_token_update_fn_hand(
+         self,
+         kps3d_emb_start_idx,

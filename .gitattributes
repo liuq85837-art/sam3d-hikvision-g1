@@ -1,0 +1,10 @@
+* text=auto
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.xml text eol=lf
+*.cjs text eol=lf
+*.patch -text
+assets/unitree_g1/** -text
+*.stl binary
+*.STL binary

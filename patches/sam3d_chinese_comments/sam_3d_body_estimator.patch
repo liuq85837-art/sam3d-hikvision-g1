@@ -1,0 +1,276 @@
+diff --git a/sam_3d_body/sam_3d_body_estimator.py b/sam_3d_body/sam_3d_body_estimator.py
+--- a/sam_3d_body/sam_3d_body_estimator.py
++++ b/sam_3d_body/sam_3d_body_estimator.py
+@@ -1,4 +1,8 @@
+ # Copyright (c) Meta Platforms, Inc. and affiliates.
++# 中文阅读说明：这是“单张完整图像 -> 人体框/掩膜 -> 批量人体裁剪 -> SAM 3D Body -> NumPy结果”的接口封装。
++# 网络主体在 models/meta_arch/sam3d_body.py；此文件负责准备输入、选择推理入口并整理每个人的输出。
++# 本接口不做跨帧身份跟踪、时序平滑、相机运动补偿或世界坐标重建；相机坐标到世界坐标仍需外部处理。
++# 下文以 N 表示本图人体框数量，H/W 表示原图高/宽，Hin/Win 表示模型裁剪输入高/宽。
+ from typing import Optional, Union
+ 
+ import cv2
+@@ -20,6 +24,8 @@
+ 
+ 
+ class SAM3DBodyEstimator:
++    # model 必须已加载权重并放到目标设备；构造函数这里只接收它，不负责下载或加载检查点。
++    # detector/segmentor/FOV estimator 都是可选组件，分别提供人体框、分割掩膜和相机内参估计。
+     def __init__(
+         self,
+         sam_3d_body_model,
+@@ -28,16 +34,20 @@
+         human_segmentor=None,
+         fov_estimator=None,
+     ):
++        # 记录模型设备和组件引用；注意后面的 batch 搬运仍写死为 "cuda"，并未使用 self.device。
+         self.device = sam_3d_body_model.device
+         self.model, self.cfg = sam_3d_body_model, model_cfg
+         self.detector = human_detector
+         self.sam = human_segmentor
+         self.fov_estimator = fov_estimator
++        # full 分支用此旋转差阈值（弧度）筛选手腕预测，决定哪些手部细化结果可以参与融合。
+         self.thresh_wrist_angle = 1.4
+ 
+         # For mesh visualization
++        # faces 是 [F, 3] 的三角面顶点索引；这里只提供拓扑，实际网格顶点由后续推理产生。
+         self.faces = self.model.head_pose.faces.cpu().numpy()
+ 
++        # 这些提示描述可选组件是否存在，不会阻止使用显式 bboxes/masks/cam_int 的后续调用。
+         if self.detector is None:
+             print("No human detector is used...")
+         if self.sam is None:
+@@ -45,6 +55,9 @@
+         if self.fov_estimator is None:
+             print("No FOV estimator... Using the default FOV!")
+ 
++        # 人体预处理顺序：框中心/尺寸（默认 padding=1.25）-> 仿射裁剪 -> RGB图像转Tensor。
++        # IMAGE_SIZE 按 (Win, Hin) 解释；TopdownAffine 同时保存原图到裁剪图的仿射矩阵并变换掩膜。
++        # 对常见 uint8 输入，ToTensor 将 [H, W, 3]、0~255 转为 [3, Hin, Win]、0~1。
+         self.transform = Compose(
+             [
+                 GetBBoxCenterScale(),
+@@ -52,6 +65,7 @@
+                 VisionTransformWrapper(ToTensor()),
+             ]
+         )
++        # 手部细化另用 padding=0.9 的裁剪流程；实际手框还会按模型输入宽高比调整，不是直接截取原框。
+         self.transform_hand = Compose(
+             [
+                 GetBBoxCenterScale(padding=0.9),
+@@ -60,6 +74,7 @@
+             ]
+         )
+ 
++    # 推理期间关闭梯度记录；这不等同于 model.eval()，训练/评估状态仍由调用方设置。
+     @torch.no_grad()
+     def process_one_image(
+         self,
+@@ -89,25 +104,41 @@
+                 - hand: inference with hand decoder only (only hand output)
+         """
+ 
++        # 参数补充（保留上方原始接口声明）：
++        # img 为 str 时按图像路径读取；数组应是 RGB、[H, W, 3]，通常为 uint8。
++        # bboxes 为原图像素坐标的 [N, 4]，顺序是 [x1, y1, x2, y2]，不是归一化坐标或 xywh。
++        # masks 应与显式 bboxes 一一对应，通常提供 [N, H, W] 或 [N, H, W, 1] 的前景掩膜。
++        # cam_int 虽标注为 np.ndarray，下面实际调用 .to()，因此当前实现要求 torch.Tensor [1, 3, 3]。
++        # K 使用原图像素坐标和像素焦距；这里不进行相机标定、畸变校正或外参变换。
++        # det_cat_id/bbox_thr/nms_thr 仅传给检测器；已有 bboxes 时不会再执行检测或阈值筛选。
++        # use_mask 请求可选分割器生成掩膜；显式 masks 会将其置为 True 并跳过分割器。
++        # 正常 body/full 返回长度 N 的列表，每项对应一个框；空框返回 []，hand 的现有接口限制见下文。
+         # clear all cached results
++        # 先丢弃上一张图的交互缓存；本次使用局部变量 batch，并不会在下面重新赋值给 self.batch。
+         self.batch = None
+         self.image_embeddings = None
+         self.output = None
+         self.prev_prompt = []
++        # 释放CUDA缓存分配器中未使用的缓存块，不是销毁模型权重，也不表示CPU推理已被支持。
+         torch.cuda.empty_cache()
+ 
++        # 路径分支用 OpenCV 读取 BGR；这里严格判断 type(img) == str，Path 对象不会自动走该分支。
+         if type(img) == str:
+             img = load_image(img, backend="cv2", image_format="bgr")
+             image_format = "bgr"
+         else:
++            # 数组分支直接假定RGB，不检测或自动纠正调用方传入的BGR顺序。
+             print("####### Please make sure the input image is in RGB format")
+             image_format = "rgb"
+         height, width = img.shape[:2]
+ 
++        # 人体框优先级：调用方给定框 > 检测器输出 > 整张图作为一个框。
++        # is_crop 记录是否使用人体框；此时 img 仍是原图，真正裁剪在 prepare_batch 的 transform 中完成。
+         if bboxes is not None:
+             boxes = bboxes.reshape(-1, 4)
+             self.is_crop = True
+         elif self.detector is not None:
++            # 检测器入口需要BGR，因此RGB数组会先转一次BGR，检测后再统一转回RGB。
+             if image_format == "rgb":
+                 img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                 image_format = "bgr"
+@@ -117,19 +148,23 @@
+                 det_cat_id=det_cat_id,
+                 bbox_thr=bbox_thr,
+                 nms_thr=nms_thr,
++                # 检测器未找到人时返回空框；不要悄悄把背景当成整幅人体图继续推理。
+                 default_to_full_image=False,
+             )
+             print("Found boxes:", boxes)
+             self.is_crop = True
+         else:
++            # 没有检测器也没有显式框时，调用方需要保证整图适合作为单个人体输入。
+             boxes = np.array([0, 0, width, height]).reshape(1, 4)
+             self.is_crop = False
+ 
+         # If there are no detected humans, don't run prediction
++        # 在构造批次和运行网络前结束，返回类型仍是列表。
+         if len(boxes) == 0:
+             return []
+ 
+         # The following models expect RGB images instead of BGR
++        # 从此处开始，分割器、FOV估计器和SAM 3D Body接收的原图统一为RGB。
+         if image_format == "bgr":
+             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+ 
+@@ -137,45 +172,61 @@
+         masks_score = None
+         if masks is not None:
+             # Use provided masks - ensure they match the number of detected boxes
++            # 当前断言只要求显式提供 bboxes；N是否一致仍由调用方负责，后面按人体索引取掩膜。
+             print(f"Using provided masks: {masks.shape}")
+             assert (
+                 bboxes is not None
+             ), "Mask-conditioned inference requires bboxes input!"
++            # 仅重排形状并转uint8，没有对概率图执行阈值化；应预先准备适当的前景掩膜。
+             masks = masks.reshape(-1, height, width, 1).astype(np.uint8)
++            # 显式掩膜的分数被固定为1，是条件输入有效性的标记，不是本次网络预测置信度。
+             masks_score = np.ones(
+                 len(masks), dtype=np.float32
+             )  # Set high confidence for provided masks
+             use_mask = True
+         elif use_mask and self.sam is not None:
++            # 分割器以RGB原图和原图坐标框为输入；其返回掩膜/分数由后面的prepare_batch逐人取用。
+             print("Running SAM to get mask from bbox...")
+             # Generate masks using SAM2
+             masks, masks_score = self.sam.run_sam(img, boxes)
+         else:
++            # 没有可用掩膜时，prepare_batch 会为每个人补零掩膜和0分数；最终返回的 mask 仍为 None。
+             masks, masks_score = None, None
+ 
+         #################### Construct batch data samples ####################
++        # 每个框先单独裁剪，再组合成单图多人批次：img=[1,N,3,Hin,Win]，mask=[1,N,1,Hin,Win]。
++        # batch还包含bbox、bbox_center/scale、affine_trans、person_valid，以及保留RGB原图的img_ori。
++        # 此处未向prepare_batch传内参，先生成默认K：fx=fy=sqrt(H^2+W^2)，主点=(W/2,H/2)。
+         batch = prepare_batch(img, self.transform, boxes, masks, masks_score)
+ 
+         #################### Run model inference on an image ####################
++        # 现有实现硬编码CUDA；更改构造函数记录的self.device不会自动更改这一行或核心模型里的.cuda()。
+         batch = recursive_to(batch, "cuda")
++        # 初始化单图/多人维度和person_valid，使核心模型可以将 [1,N,...] 展平成 [N,...]。
+         self.model._initialize_batch(batch)
+ 
+         # Handle camera intrinsics
+         # - either provided externally or generated via default FOV estimator
++        # 内参优先级：显式cam_int > FOV估计器 > prepare_batch的图像对角线焦距先验。
++        # 传入K或估计K会覆盖batch中默认值；.to(batch["img"])同时对齐dtype和设备。
+         if cam_int is not None:
+             print("Using provided camera intrinsics...")
+             cam_int = cam_int.to(batch["img"])
+             batch["cam_int"] = cam_int.clone()
+         elif self.fov_estimator is not None:
+             print("Running FOV estimator ...")
++            # img_ori由NoCollate包装，.data取回未经人体裁剪的完整RGB图，而不是网络输入裁剪图。
+             input_image = batch["img_ori"][0].data
+             cam_int = self.fov_estimator.get_cam_intrinsics(input_image).to(
+                 batch["img"]
+             )
+             batch["cam_int"] = cam_int.clone()
+         else:
++            # 默认K只是内参先验，不能因此把单目人体尺度称为已标定的真实米制尺度。
+             cam_int = batch["cam_int"].clone()
+ 
++        # body：仅身体解码器，但仍预测完整人体；full：身体预测后裁左右手、细化并融合手部结果。
++        # hand：核心仅运行手解码器；本封装后处理目前仍假定存在身体mhr输出，并未完整适配该模式。
+         outputs = self.model.run_inference(
+             img,
+             batch,
+@@ -184,38 +235,65 @@
+             thresh_wrist_angle=self.thresh_wrist_angle,
+         )
+         if inference_type == "full":
++            # full核心返回五元组；这里保留最终身体结果和两个手裁剪批次，忽略两个独立手部输出字典。
+             pose_output, batch_lhand, batch_rhand, _, _ = outputs
+         else:
++            # body/hand核心返回单个字典，而不是上述五元组。
+             pose_output = outputs
+ 
++        # 当前hand路径中mhr为None、有效结果在mhr_hand；下面统一读取mhr会导致后续逐字段访问失败。
++        # 这是现有封装的行为说明，本次注释未改动分支或补做hand返回适配。
+         out = pose_output["mhr"]
++        # 将嵌套输出先搬到CPU再转NumPy，下面不再向调用方暴露CUDA张量。
+         out = recursive_to(out, "cpu")
+         out = recursive_to(out, "numpy")
+         all_out = []
++        # prepare_batch的首维是单张图，第二维才是人数；核心输出的这两维已经展平，因此用idx逐人取值。
+         for idx in range(batch["img"].shape[1]):
+             all_out.append(
+                 {
++                    # [4]：原始输入/检测框的xyxy像素坐标；不是经过padding扩大的网络裁剪框。
+                     "bbox": batch["bbox"][0, idx].cpu().numpy(),
++                    # 标量：相机头使用的像素焦距，取K的fx；不是独立相机标定的输出证据。
+                     "focal_length": out["focal_length"][idx],
++                    # [70,3]：MHR70三维关键点，已转换到相机轴方向，但尚未加pred_cam_t；单位按模型为米。
++                    # 相机坐标点 = pred_keypoints_3d + pred_cam_t；此时才可用K做透视投影，仍不是世界坐标。
++                    # 常用光学轴约定为x向右、y向下、z向前；也不要把这里的原点默认当作显式髋中点。
+                     "pred_keypoints_3d": out["pred_keypoints_3d"][idx],
++                    # [70,2]：原图像素中的三维重投影，不是裁剪图归一化坐标，也不是独立二维检测真值。
++                    # full核心末尾重新投影时采用单一focal和原图中心；不能假设该分支完整保留任意K的非中心主点。
+                     "pred_keypoints_2d": out["pred_keypoints_2d"][idx],
++                    # [V,3]：人体表面网格顶点；与关键点一样需另加pred_cam_t，faces拓扑见self.faces。
+                     "pred_vertices": out["pred_vertices"][idx],
++                    # [3]：人体整体到光学相机坐标的平移(tx,ty,tz)，模型米单位；不是相机在世界中的位置。
+                     "pred_cam_t": out["pred_cam_t"][idx],
++                    # [266]：6维全局旋转表示 + 260维身体连续表示；full融合末尾会清零使其失效，不能再作最终姿态用。
+                     "pred_pose_raw": out["pred_pose_raw"][idx],
++                    # [3]：MHR头的ZYX欧拉角表示（弧度），不是机器人根四元数或已标定世界朝向。
+                     "global_rot": out["global_rot"][idx],
++                    # [133]：MHR身体参数，包含旋转及部分平移项；不是133个通用骨架关节或G1关节角。
+                     "body_pose_params": out["body_pose"][idx],
++                    # [108]：左右手各54维连续姿态系数；[28]/[45]/[72]分别为尺度、形状和表情参数。
+                     "hand_pose_params": out["hand"][idx],
+                     "scale_params": out["scale"][idx],
+                     "shape_params": out["shape"][idx],
++                    # 当前MHRHead.forward将表情预测乘0，因此此字段通常是零向量，不代表额外的人脸表情识别。
+                     "expr_params": out["face"][idx],
++                    # 返回原图空间掩膜（如存在），不是batch中已经仿射裁剪到Hin/Win的那一份。
+                     "mask": masks[idx] if masks is not None else None,
++                    # [J,3]：MHR内部骨架关节位置；编号域不同于70个观测关键点，同样尚未加相机平移。
+                     "pred_joint_coords": out["pred_joint_coords"][idx],
++                    # [J,3,3]：透传MHR骨架内部的关节全局旋转；“global”不指采集场地世界系。
++                    # 旋转矩阵的MHR轴约定也不能直接等同于上面经过相机轴翻转的点坐标约定。
+                     "pred_global_rots": out["joint_global_rots"][idx],
++                    # [204]：供MHR模型重建的内部参数向量（全局参数、身体参数、68维尺度），不是机器人qpos。
+                     "mhr_model_params": out["mhr_model_params"][idx],
+                 }
+             )
+ 
+             if inference_type == "full":
++                # full额外提供左右手裁剪框：[cx-w/2,cy-h/2,cx+w/2,cy+h/2]，每个都是[4]原图像素坐标。
++                # core已把左手框中心从水平翻转图恢复到原图；这里使用裁剪的center/scale而非原始检测手框。
+                 all_out[-1]["lhand_bbox"] = np.array(
+                     [
+                         (
+@@ -236,6 +314,7 @@
+                         ).item(),
+                     ]
+                 )
++                # 右手不需要水平翻转，按同样公式还原xyxy；.item()将单元素张量转为Python数值。
+                 all_out[-1]["rhand_bbox"] = np.array(
+                     [
+                         (
+@@ -257,4 +336,5 @@
+                     ]
+                 )
+ 
++        # 每一项均为一个人体的NumPy结果字典；身份关联、世界变换、时序处理与机器人重定向由上层负责。
+         return all_out

@@ -1,0 +1,3 @@
+# Byte hashes in manifest.json describe these exact LF patch bytes.
+*.patch text eol=lf
+LICENSE.sam3d -text

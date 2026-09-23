@@ -1,0 +1,18 @@
+{
+  "desktop": {
+    "title": "SAM 3D Body 零基础完整说明书",
+    "chapters": 22,
+    "headings": 23,
+    "codeBlocks": 33,
+    "tables": 22,
+    "imagesLoaded": true,
+    "brokenAnchors": [],
+    "pageOverflow": false
+  },
+  "mobile": {
+    "pageOverflow": false
+  },
+  "errors": [],
+  "externalRequests": [],
+  "passed": true
+}
